@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"runtime/debug"
 	"strconv"
@@ -39,6 +42,7 @@ type HTTPClientConfig struct {
 	ConnectionTimeout  time.Duration
 	Timeout            time.Duration
 	ResponseBufferSize int
+	CompatibilityMode  bool
 }
 
 type HTTPClient struct {
@@ -47,8 +51,11 @@ type HTTPClient struct {
 	host           string
 	auth           string
 	conn           net.Conn
+	proxy          *url.URL
+	proxyAuth      string
 	respBuf        []byte
 	config         *HTTPClientConfig
+	goClient       *http.Client
 	redirectsCount int
 }
 
@@ -76,8 +83,21 @@ func NewHTTPClient(baseURL string, config *HTTPClientConfig) *HTTPClient {
 	client.respBuf = make([]byte, config.ResponseBufferSize)
 	client.config = config
 
+	if config.CompatibilityMode {
+		client.goClient = &http.Client{
+			// #TODO
+			// CheckRedirect: redirectPolicyFunc,
+		}
+	}
+
 	if u.User != nil {
 		client.auth = "Basic " + base64.StdEncoding.EncodeToString([]byte(u.User.String()))
+	}
+
+	client.proxy, _ = http.ProxyFromEnvironment(&http.Request{URL: u})
+
+	if client.isProxy() && client.proxy.User != nil {
+		client.proxyAuth = "Basic " + base64.StdEncoding.EncodeToString([]byte(client.proxy.User.String()))
 	}
 
 	return client
@@ -86,13 +106,62 @@ func NewHTTPClient(baseURL string, config *HTTPClientConfig) *HTTPClient {
 func (c *HTTPClient) Connect() (err error) {
 	c.Disconnect()
 
+	var toDial string
 	if !strings.Contains(c.host, ":") {
-		c.conn, err = net.DialTimeout("tcp", c.host+":"+defaultPorts[c.scheme], c.config.ConnectionTimeout)
+		toDial = c.host + ":" + defaultPorts[c.scheme]
 	} else {
-		c.conn, err = net.DialTimeout("tcp", c.host, c.config.ConnectionTimeout)
+		toDial = c.host
+	}
+
+	if c.isProxy() {
+		if c.proxy.Scheme != "http" {
+			panic("Unsupported HTTP Proxy method")
+		}
+		Debug("[HTTPClient] Connecting to proxy", c.proxy.String(), "<>", toDial)
+		c.conn, err = net.DialTimeout("tcp", c.proxy.Host, c.config.ConnectionTimeout)
+		if err != nil {
+			return
+		}
+		if c.scheme == "https" {
+			c.conn.Write([]byte("CONNECT " + toDial + " HTTP/1.1\r\n"))
+			if c.proxyAuth != "" {
+				c.conn.Write([]byte("Proxy-Authorization: " + c.proxyAuth + "\r\n"))
+			}
+			c.conn.Write([]byte("\r\n"))
+			br := bufio.NewReader(c.conn)
+			l, _, err := br.ReadLine()
+			if err != nil {
+				return err
+			}
+			if len(l) < 12 {
+				panic("HTTP proxy did not respond correctly")
+			}
+			status := l[9:12]
+			if !bytes.Equal(status, []byte("200")) {
+				panic("HTTP proxy did not respond correctly")
+			}
+			for {
+				// Read until we find the empty line
+				l, _, err := br.ReadLine()
+				if err != nil {
+					return err
+				}
+				if len(l) == 0 {
+					break
+				}
+			}
+		}
+		Debug("[HTTPClient] Proxy successfully connected")
+	} else {
+		c.conn, err = net.DialTimeout("tcp", toDial, c.config.ConnectionTimeout)
+		if err != nil {
+			return
+		}
 	}
 
 	if c.scheme == "https" {
+		// Wrap our socket in TLS
+		Debug("[HTTPClient] Wrapping socket in TLS", c.host)
 		tlsConn := tls.Client(c.conn, &tls.Config{InsecureSkipVerify: true, ServerName: c.host})
 
 		if err = tlsConn.Handshake(); err != nil {
@@ -100,6 +169,7 @@ func (c *HTTPClient) Connect() (err error) {
 		}
 
 		c.conn = tlsConn
+		Debug("[HTTPClient] Successfully wrapped in TLS")
 	}
 
 	return
@@ -113,16 +183,10 @@ func (c *HTTPClient) Disconnect() {
 	}
 }
 
-func (c *HTTPClient) isAlive() bool {
-	one := make([]byte, 1)
-
+func (c *HTTPClient) isAlive(readBytes *int) bool {
 	// Ready 1 byte from socket without timeout to check if it not closed
 	c.conn.SetReadDeadline(time.Now().Add(time.Millisecond))
-	_, err := c.conn.Read(one)
-
-	if err == nil {
-		return true
-	}
+	n, err := c.conn.Read(c.respBuf[:1])
 
 	if err == io.EOF {
 		Debug("[HTTPClient] connection closed, reconnecting")
@@ -133,13 +197,43 @@ func (c *HTTPClient) isAlive() bool {
 		Debug("Detected broken pipe.", err)
 		return false
 	}
-
+	if n != 0 {
+		*readBytes += n
+		Debug("[HTTPClient] isAlive readBytes ", *readBytes)
+	}
 	return true
 }
 
-func (c *HTTPClient) Send(data []byte) (response []byte, err error) {
-	var payload []byte
+func (c *HTTPClient) SendGoClient(data []byte) ([]byte, error) {
+	var req *http.Request
+	var resp *http.Response
+	var err error
 
+	req, err = http.ReadRequest(bufio.NewReader(bytes.NewBuffer(data)))
+	if err != nil {
+		return nil, err
+	}
+
+	if !c.config.OriginalHost {
+		req.Host = c.host
+	}
+
+	if c.auth != "" {
+		req.Header.Add("Authorization", c.auth)
+	}
+
+	req.URL, _ = url.ParseRequestURI(c.scheme + "://" + c.host + req.RequestURI)
+	req.RequestURI = ""
+
+	resp, err = c.goClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	return httputil.DumpResponse(resp, true)
+}
+
+func (c *HTTPClient) Send(data []byte) (response []byte, err error) {
 	// Don't exit on panic
 	defer func() {
 		if r := recover(); r != nil {
@@ -153,7 +247,12 @@ func (c *HTTPClient) Send(data []byte) (response []byte, err error) {
 		}
 	}()
 
-	if c.conn == nil || !c.isAlive() {
+	if c.config.CompatibilityMode {
+		return c.SendGoClient(data)
+	}
+
+	var readBytes int
+	if c.conn == nil || !c.isAlive(&readBytes) {
 		Debug("[HTTPClient] Connecting:", c.baseURL)
 		if err = c.Connect(); err != nil {
 			log.Println("[HTTPClient] Connection error:", err)
@@ -170,6 +269,16 @@ func (c *HTTPClient) Send(data []byte) (response []byte, err error) {
 		data = proto.SetHost(data, []byte(c.baseURL), []byte(c.host))
 	}
 
+	if c.isProxy() && c.scheme == "http" {
+		path := proto.Path(data)
+		if len(path) > 0 && path[0] == '/' {
+			data = proto.SetPath(data, c.proxyPath(path))
+			if c.proxyAuth != "" {
+				data = proto.SetHeader(data, []byte("Proxy-Authorization"), []byte(c.proxyAuth))
+			}
+		}
+	}
+
 	if c.auth != "" {
 		data = proto.SetHeader(data, []byte("Authorization"), []byte(c.auth))
 	}
@@ -178,13 +287,19 @@ func (c *HTTPClient) Send(data []byte) (response []byte, err error) {
 		Debug("[HTTPClient] Sending:", string(data))
 	}
 
+	return c.send(data, readBytes, timeout)
+}
+
+func (c *HTTPClient) send(data []byte, readBytes int, timeout time.Time) (response []byte, err error) {
+	var payload []byte
+	var n int
 	if _, err = c.conn.Write(data); err != nil {
 		Debug("[HTTPClient] Write error:", err, c.baseURL)
 		response = errorPayload(HTTP_TIMEOUT)
+		c.Disconnect()
 		return
 	}
 
-	var readBytes, n int
 	var currentChunk []byte
 	timeout = time.Now().Add(c.config.Timeout)
 	chunked := false
@@ -205,13 +320,21 @@ func (c *HTTPClient) Send(data []byte) (response []byte, err error) {
 				currentContentLength += n
 			} else {
 				// If headers are finished
-
-				if bytes.Contains(c.respBuf[:readBytes], proto.EmptyLine) {
+				var firstEmptyLine = bytes.Index(c.respBuf[:readBytes], proto.EmptyLine)
+				if firstEmptyLine != -1 {
 					if bytes.Equal(proto.Header(c.respBuf[:readBytes], []byte("Transfer-Encoding")), []byte("chunked")) {
 						chunked = true
 					} else {
 						status, _ := strconv.Atoi(string(proto.Status(c.respBuf[:readBytes])))
-						if (status >= 100 && status < 200) || status == 204 || status == 304 {
+						// We want to soak up all 100 Continues received to get the real result code
+						if status >= 100 && status < 200 {
+							timeout = time.Now().Add(c.config.Timeout)
+							var deleteLen = firstEmptyLine + len(proto.EmptyLine)
+							copy(c.respBuf, c.respBuf[deleteLen:readBytes])
+							readBytes -= deleteLen
+							chunks--
+							continue
+						} else if status == 204 || status == 304 {
 							contentLength = 0
 							break
 						} else {
@@ -298,9 +421,9 @@ func (c *HTTPClient) Send(data []byte) (response []byte, err error) {
 
 	if err != nil && readBytes == 0 {
 		maxRead := 100
-    	if readBytes < maxRead {
-    		maxRead = readBytes
-    	}
+		if readBytes < maxRead {
+			maxRead = readBytes
+		}
 		Debug("[HTTPClient] Response read timeout error", err, c.conn, readBytes, string(c.respBuf[:maxRead]))
 		response = errorPayload(HTTP_TIMEOUT)
 		c.Disconnect()
@@ -309,9 +432,9 @@ func (c *HTTPClient) Send(data []byte) (response []byte, err error) {
 
 	if readBytes < 4 || string(c.respBuf[:4]) != "HTTP" {
 		maxRead := 100
-    	if readBytes < maxRead {
-    		maxRead = readBytes
-    	}
+		if readBytes < maxRead {
+			maxRead = readBytes
+		}
 		Debug("[HTTPClient] Response read unknown error", err, c.conn, readBytes, string(c.respBuf[:maxRead]))
 		response = errorPayload(HTTP_UNKNOWN_ERROR)
 		c.Disconnect()
@@ -336,7 +459,7 @@ func (c *HTTPClient) Send(data []byte) (response []byte, err error) {
 			c.redirectsCount++
 
 			location := proto.Header(payload, []byte("Location"))
-			redirectPayload := []byte("GET " + string(location) + " HTTP/1.1\r\n\r\n")
+			redirectPayload := proto.SetPath(data, location)
 
 			if c.config.Debug {
 				Debug("[HTTPClient] Redirecting to: " + string(location))
@@ -368,6 +491,14 @@ func (c *HTTPClient) Post(path string, body []byte) (response []byte, err error)
 	payload += string(body)
 
 	return c.Send([]byte(payload))
+}
+
+func (c *HTTPClient) proxyPath(path []byte) []byte {
+	return append([]byte(c.scheme+"://"+c.host), path...)
+}
+
+func (c *HTTPClient) isProxy() bool {
+	return c.proxy != nil
 }
 
 const (

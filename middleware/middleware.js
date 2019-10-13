@@ -45,7 +45,7 @@ function init() {
                 if (proxy.ch[chanID]) {
                     proxy.ch[chanID].forEach(function(ch){
                         let r = ch.cb(msg);
-                        if (r) resp = r; // If one of callback decided not to send response back, do not override it in global callbacks
+                        if (resp) resp = r; // If one of callback decided not to send response back, do not override it in global callbacks
                     })
                     
                     // Cleanup Individual message channels to avoid memory leaks
@@ -58,6 +58,8 @@ function init() {
             if (resp) {
               process.stdout.write(`${resp.rawMeta.toString('hex')}${Buffer.from("\n").toString("hex")}${resp.http.toString('hex')}\n`)
             }
+
+            return resp
         }
     }
 
@@ -253,6 +255,21 @@ function setHttpStatus(payload, newStatus) {
     return setHttpPath(payload, newStatus);
 }
 
+function httpHeaders(payload) {
+    var httpHeaderString = payload.slice(0,payload.indexOf("\r\n\r\n") + 4).toString().split("\n").slice(1);
+    var headers = {};
+
+    for (var item in httpHeaderString) {
+        var parts = httpHeaderString[item].split(":");
+
+        if (parts.length > 1) {
+            headers[parts[0]] = parts.slice(1).join(":").trim();    
+        }
+    }
+
+    return headers;
+}
+
 function httpHeader(payload, name) {
     var currentLine = 0;
     var i = 0;
@@ -307,6 +324,16 @@ function setHttpHeader(payload, name, value) {
     }
 }
 
+function deleteHttpHeader(payload, name) {
+	let header = httpHeader(payload, name);
+
+    if (header) {
+        return Buffer.concat([payload.slice(0, header.start), payload.slice(header.end+1, payload.length)])
+    }
+
+	return payload
+}
+
 function httpBody(payload) {
     return payload.slice(payload.indexOf("\r\n\r\n") + 4, payload.length);
 }
@@ -354,13 +381,20 @@ function setHttpCookie(payload, name, value) {
     return setHttpHeader(payload, "Cookie", cookies.join("; "))
 }
 
+function deleteHttpCookie(payload, name) {
+    let h = httpHeader(payload, "Cookie");
+    let cookie = h ? h.value : "";
+    let cookies = cookie.split("; ").filter(function(v){ return v.indexOf(name + "=") != 0 })
+    return setHttpHeader(payload, "Cookie", cookies.join("; "))
+}
+
 function httpCookie(payload, name) {
     let h = httpHeader(payload, "Cookie");
     let cookie = h ? h.value : "";
     let value;
     let cookies = cookie.split("; ").forEach(function(v){
         if (v.indexOf(name + "=") == 0) {
-            value = v.split("=")[1];
+            value = v.substr(name.length + 1);
         }
     })
     return value;
@@ -380,21 +414,24 @@ module.exports = {
     setHttpStatus: setHttpStatus,
     httpHeader: httpHeader,
     setHttpHeader: setHttpHeader,
+    deleteHttpHeader: deleteHttpHeader,
     httpBody: httpBody,
     setHttpBody: setHttpBody,
     httpBodyParam: httpBodyParam,
     setHttpBodyParam: setHttpBodyParam,
     httpCookie: httpCookie,
     setHttpCookie: setHttpCookie,
+    deleteHttpCookie: deleteHttpCookie,
     test: testRunner,
-    benchmark: testBenchmark
+    benchmark: testBenchmark,
+    httpHeaders: httpHeaders
 }
 
 
 // =========== Tests ==============
 
 function testRunner(){
-    ["init", "parseMessage", "httpMethod", "httpPath", "setHttpHeader", "httpPathParam", "httpHeader", "httpBody", "setHttpBody", "httpBodyParam", "httpCookie", "setHttpCookie"].forEach(function(t){
+    ["init", "filter", "parseMessage", "httpMethod", "httpPath", "setHttpHeader", "deleteHttpHeader", "httpPathParam", "httpHeader", "httpBody", "setHttpBody", "httpBodyParam", "httpCookie", "setHttpCookie", "deleteHttpCookie", "httpHeaders"].forEach(function(t){
         console.log(`====== Start ${t} =======`)
         eval(`TEST_${t}()`)
         console.log(`====== End ${t} =======`)
@@ -468,6 +505,7 @@ function TEST_init() {
     let req = parseMessage(Buffer.from("1 2 3\nGET / HTTP/1.1\r\n\r\n").toString('hex'));
     let resp = parseMessage(Buffer.from("2 2 3\nHTTP/1.1 200 OK\r\n\r\n").toString('hex'));
     let resp2 = parseMessage(Buffer.from("2 3 3\nHTTP/1.1 200 OK\r\n\r\n").toString('hex'));
+    
     gor.emit(req);
     gor.emit(resp);
     gor.emit(resp2);
@@ -477,6 +515,34 @@ function TEST_init() {
     if (received != 5) {
         fail(`Should receive 5 messages: ${received}`);
     }
+}
+
+function TEST_filter() {
+    const child_process = require('child_process');
+
+    let gor = init();
+    gor.on("request", function(req){
+        if (httpPath(req.http) != "/filter") {
+            return req
+        }
+    });
+
+    gor.on("request", function(req){
+        return req
+    });
+
+
+    let reqPass = parseMessage(Buffer.from("1 2 3\nGET / HTTP/1.1\r\n\r\n").toString('hex'));
+    let reqFilter = parseMessage(Buffer.from("1 2 3\nGET /filter HTTP/1.1\r\n\r\n").toString('hex'));
+    
+    if (!gor.emit(reqPass)) {
+        return fail("Should not filter request")
+    }
+
+    if (gor.emit(reqFilter)) {
+        return fail("Should filter request even if one middleware rejected it")
+    }
+
 }
 
 function TEST_parseMessage() {
@@ -626,6 +692,18 @@ function TEST_setHttpHeader() {
     }
 }
 
+function TEST_deleteHttpHeader() {
+    const examplePayload = "GET / HTTP/1.1\r\nUser-Agent: Node\r\nContent-Length: 5\r\n\r\nhello";
+
+    // Adding new header
+    let expected = `GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello`;
+    let p = Buffer.from(examplePayload);
+    p = deleteHttpHeader(p, "User-Agent", "test");
+    if (p != expected) {
+        console.error(`setHeader failed, expected delete header 'User-Agent' header: ${p}`)
+    }
+}
+
 function TEST_httpBody() {
     const examplePayload = "GET / HTTP/1.1\r\nUser-Agent: Node\r\nContent-Length: 5\r\n\r\nhello";
     let body = httpBody(Buffer.from(examplePayload));
@@ -667,4 +745,35 @@ function TEST_setHttpCookie() {
     if (p != "GET / HTTP/1.1\r\nCookie: a=b; test=zxc; new=one\r\n\r\n") {
         return fail(`Should add new cookie: ${p}`)
     }
+}
+
+function TEST_deleteHttpCookie() {
+    const examplePayload = "GET / HTTP/1.1\r\nCookie: a=b; test=zxc\r\n\r\n";
+    let p = deleteHttpCookie(Buffer.from(examplePayload), "a");
+    if (p != "GET / HTTP/1.1\r\nCookie: test=zxc\r\n\r\n") {
+        return fail(`Should delete cookie: ${p}`)
+    }
+}
+
+
+function TEST_httpHeaders() {
+    const examplePayload = "GET / HTTP/1.1\r\nHost: localhost:3000\r\nUser-Agent: Node\r\nContent-Length:5\r\n\r\nhello";
+
+    let expectedHeaders = {"Host": "localhost:3000", "User-Agent": "Node", "Content-Length": "5"}
+    let payload = Buffer.from(examplePayload);
+    let headers = httpHeaders(payload);
+
+    ["Host", "User-Agent", "Content-Length"].forEach(function(header){
+        let actual = headers[header];
+        let expected = expectedHeaders[header];
+
+        if (!actual) {
+            fail(`${header} Header was not found`);
+        }
+
+        if (actual != expected) {
+            fail(`${header} Header not Equal to Expected: ${expected} was ${actual}`);
+        }
+
+    })
 }

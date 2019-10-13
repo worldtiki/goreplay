@@ -20,6 +20,8 @@ type RAWInput struct {
 	trackResponse bool
 	listener      *raw.Listener
 	bpfFilter     string
+	timestampType string
+	bufferSize    int
 }
 
 // Available engines for intercepting traffic
@@ -30,7 +32,7 @@ const (
 )
 
 // NewRAWInput constructor for RAWInput. Accepts address with port as argument.
-func NewRAWInput(address string, engine int, trackResponse bool, expire time.Duration, realIPHeader string, bpfFilter string) (i *RAWInput) {
+func NewRAWInput(address string, engine int, trackResponse bool, expire time.Duration, realIPHeader string, bpfFilter string, timestampType string, bufferSize int) (i *RAWInput) {
 	i = new(RAWInput)
 	i.data = make(chan *raw.TCPMessage)
 	i.address = address
@@ -40,6 +42,8 @@ func NewRAWInput(address string, engine int, trackResponse bool, expire time.Dur
 	i.realIPHeader = []byte(realIPHeader)
 	i.quit = make(chan bool)
 	i.trackResponse = trackResponse
+	i.timestampType = timestampType
+	i.bufferSize = bufferSize
 
 	i.listen(address)
 	i.listener.IsReady()
@@ -59,7 +63,7 @@ func (i *RAWInput) Read(data []byte) (int, error) {
 			buf = proto.SetHeader(buf, i.realIPHeader, []byte(msg.IP().String()))
 		}
 	} else {
-		header = payloadHeader(ResponsePayload, msg.UUID(), msg.AssocMessage.Start.UnixNano(), msg.End.UnixNano()-msg.AssocMessage.Start.UnixNano())
+		header = payloadHeader(ResponsePayload, msg.UUID(), msg.Start.UnixNano(), msg.End.UnixNano()-msg.AssocMessage.End.UnixNano())
 	}
 
 	copy(data[0:len(header)], header)
@@ -77,7 +81,7 @@ func (i *RAWInput) listen(address string) {
 		log.Fatal("input-raw: error while parsing address", err)
 	}
 
-	i.listener = raw.NewListener(host, port, i.engine, i.trackResponse, i.expire, i.bpfFilter)
+	i.listener = raw.NewListener(host, port, i.engine, i.trackResponse, i.expire, i.bpfFilter, i.timestampType, i.bufferSize, Settings.inputRAWOverrideSnapLen, Settings.inputRAWImmediateMode)
 
 	ch := i.listener.Receiver()
 

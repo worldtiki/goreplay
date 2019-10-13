@@ -44,7 +44,7 @@ func TestRAWInputIPv4(t *testing.T) {
 
 	var respCounter, reqCounter int64
 
-	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "X-Real-IP", "")
+	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "X-Real-IP", "", "", 0)
 	defer input.Close()
 
 	output := NewTestOutput(func(data []byte) {
@@ -106,7 +106,7 @@ func TestRAWInputNoKeepAlive(t *testing.T) {
 
 	originAddr := listener.Addr().String()
 
-	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "")
+	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "", "", 0)
 	defer input.Close()
 
 	output := NewTestOutput(func(data []byte) {
@@ -152,7 +152,7 @@ func TestRAWInputIPv6(t *testing.T) {
 
 	var respCounter, reqCounter int64
 
-	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "")
+	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "", "", 0)
 	defer input.Close()
 
 	output := NewTestOutput(func(data []byte) {
@@ -203,7 +203,7 @@ func TestInputRAW100Expect(t *testing.T) {
 
 	originAddr := strings.Replace(origin.Listener.Addr().String(), "[::]", "127.0.0.1", -1)
 
-	input := NewRAWInput(originAddr, EnginePcap, true, time.Second, "", "")
+	input := NewRAWInput(originAddr, EnginePcap, true, time.Second, "", "", "", 0)
 	defer input.Close()
 
 	// We will use it to get content of raw HTTP request
@@ -266,7 +266,7 @@ func TestInputRAWChunkedEncoding(t *testing.T) {
 	}))
 
 	originAddr := strings.Replace(origin.Listener.Addr().String(), "[::]", "127.0.0.1", -1)
-	input := NewRAWInput(originAddr, EnginePcap, true, time.Second, "", "")
+	input := NewRAWInput(originAddr, EnginePcap, true, time.Second, "", "", "", 0)
 	defer input.Close()
 
 	replay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -330,7 +330,7 @@ func TestInputRAWLargePayload(t *testing.T) {
 	}))
 	originAddr := strings.Replace(origin.Listener.Addr().String(), "[::]", "127.0.0.1", -1)
 
-	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "")
+	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "", "", 0)
 	defer input.Close()
 
 	replay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -367,15 +367,21 @@ func TestInputRAWLargePayload(t *testing.T) {
 }
 
 func BenchmarkRAWInput(b *testing.B) {
+	var respCounter, reqCounter, replayCounter int64
+
 	quit := make(chan int)
 
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer origin.Close()
 	originAddr := strings.Replace(origin.Listener.Addr().String(), "[::]", "127.0.0.1", -1)
 
-	var respCounter, reqCounter int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&replayCounter, 1)
+	}))
+	defer origin.Close()
+	upstreamAddr := strings.Replace(upstream.Listener.Addr().String(), "[::]", "127.0.0.1", -1)
 
-	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "")
+	input := NewRAWInput(originAddr, EnginePcap, true, testRawExpire, "", "", "", 0)
 	defer input.Close()
 
 	output := NewTestOutput(func(data []byte) {
@@ -384,27 +390,29 @@ func BenchmarkRAWInput(b *testing.B) {
 		} else {
 			atomic.AddInt64(&respCounter, 1)
 		}
-
-		// log.Println("Captured ", reqCounter, "requests and ", respCounter, " responses")
 	})
 
+	httpOutput := NewLimiter(NewHTTPOutput(upstreamAddr, &HTTPOutputConfig{}), "10%")
+
 	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	Plugins.Outputs = []io.Writer{output, httpOutput}
 
 	go Start(quit)
 
 	emitted := 0
 	fileContent, _ := ioutil.ReadFile("LICENSE.txt")
 
+	time.Sleep(400 * time.Millisecond)
+
 	for i := 0; i < b.N; i++ {
 		wg := new(sync.WaitGroup)
-		wg.Add(10 * 100)
-		emitted += 10 * 100
+		wg.Add(100 * 1000)
+		emitted += 100 * 1000
 		for w := 0; w < 100; w++ {
 			go func() {
 				client := NewHTTPClient(origin.URL, &HTTPClientConfig{})
-				for i := 0; i < 10; i++ {
-					if rand.Int63n(2) == 0 {
+				for i := 0; i < 1000; i++ {
+					if i%2 == 0 {
 						client.Post("/", fileContent)
 					} else {
 						client.Get("/")
@@ -418,7 +426,7 @@ func BenchmarkRAWInput(b *testing.B) {
 	}
 
 	time.Sleep(400 * time.Millisecond)
-	log.Println("Emitted ", emitted, ", Captured ", reqCounter, "requests and ", respCounter, " responses")
+	log.Println("Emitted ", emitted, ", Captured ", reqCounter, "requests and ", respCounter, " responses", "and replayed", replayCounter)
 
 	close(quit)
 }

@@ -4,7 +4,7 @@ GoReplay support protocol for writing middleware in any language, which allows y
 
 To simplify middleware creation we provide packages for NodeJS and Go (upcoming).
 
-If you want to get access to original and replayed responses, do not forget adding `--output-http-track-respose` and `--input-raw-track-response` options.
+If you want to get access to original and replayed responses, do not forget adding `--output-http-track-response` and `--input-raw-track-response` options.
 
 ## NodeJS
 
@@ -69,7 +69,7 @@ gor.on("request", function(req) {
 })
 ```
 
-This middleware include `searchResponses` helper used to compare values from original and replayed responses. It may be helpful if auth system or xsrf protection returns unique tokens in headers or response, and you need to rewrite your requests based on them. Because tokens are unique, value contained in original and replayed response will differ, so you need to extract value from both responses, and rewrite requests based on those mappings.
+This middleware includes `searchResponses` helper which is used to compare value of original response with the replayed response. If authentication system or xsrf protection returns unique tokens in headers or the response, it will be helpful to rewrite your requests based on them. Because tokens are unique, and the value contained in original and replayed responses will be different. So, you need to extract value from both responses, and rewrite requests based on those mappings.
 
 `searchResponses` accepts request id, regexp pattern for searching the compared value (should include capture group), and callback which returns both original and replayed matched value.
 
@@ -103,6 +103,7 @@ Package expose following functions to process raw HTTP payloads:
 * `httpPathParam` - get param from URL path: `gor.httpPathParam(req.http, queryParam)`
 * `setHttpPathParam` - set URL param: `req.http = gor.setHttpPathParam(req.http, queryParam, value)` 
 * `httpStatus` - response status code
+* `httpHeaders` - get all headers: `gor.httpHeaders(req.http)`
 * `httpHeader` - get HTTP header: `gor.httpHeader(req.http, "Content-Length")`
 * `setHttpHeader` - Set HTTP header, returns modified payload: `req.http = gor.setHttpHeader(req.http, "X-Replayed", "1")`
 * `httpBody` - get HTTP Body: `gor.httpBody(req.http)`
@@ -111,10 +112,11 @@ Package expose following functions to process raw HTTP payloads:
 * `setHttpBodyParam` - set POST body param: `req.http = gor.setHttpBodyParam(req.http, param, value)`
 * `httpCookie` - get HTTP cookie: `gor.httpCookie(req.http, "SESSSION_ID")`
 * `setHttpCookie` - set HTTP cookie, returns modified payload: `req.http = gor.setHttpCookie(req.http, "iam", "cuckoo")`
+* `deleteHttpCookie` - delete HTTP cookie, returns modified payload: `req.http = gor.deleteHttpCookie(req.http, "iam")`
 
-Also it is totally legit to use standard `Buffer` functions like `indexOf` for processing the HTTP payload. Just do not forget that if you modify modify the body, update the `Content-Length` header with new value. And if you modify headers, line endings should be `\r\n`. Rest is up to your imagination.
+Also it is totally legit to use standard `Buffer` functions like `indexOf` for processing the HTTP payload. Just do not forget that if you modify the body, update the `Content-Length` header with a new value. And if you modify any of the headers, line endings should be `\r\n`. Rest is up to your imagination.
 
 
 ## Support
 
-Feel free to ask questions here and by sending email to [support@goreplay.org](mailto:support@goreplay.org). Commercial support available and welcomed 🙈.
+Feel free to ask questions here and by sending email to [support@goreplay.org](mailto:support@goreplay.org). Commercial support is available and welcomed 🙈.

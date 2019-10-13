@@ -72,7 +72,12 @@ type Listener struct {
 	trackResponse bool
 	messageExpire time.Duration
 
-	bpfFilter string
+	bpfFilter     string
+	timestampType string
+	overrideSnapLen bool
+	immediateMode bool
+
+	bufferSize int
 
 	conn        net.PacketConn
 	pcapHandles []*pcap.Handle
@@ -95,7 +100,7 @@ const (
 )
 
 // NewListener creates and initializes new Listener object
-func NewListener(addr string, port string, engine int, trackResponse bool, expire time.Duration, bpfFilter string) (l *Listener) {
+func NewListener(addr string, port string, engine int, trackResponse bool, expire time.Duration, bpfFilter string, timestampType string, bufferSize int, overrideSnapLen bool, immediateMode bool) (l *Listener) {
 	l = &Listener{}
 
 	l.packetsChan = make(chan *packet, 10000)
@@ -110,6 +115,10 @@ func NewListener(addr string, port string, engine int, trackResponse bool, expir
 	l.respWithoutReq = make(map[uint32]tcpID)
 	l.trackResponse = trackResponse
 	l.bpfFilter = bpfFilter
+	l.timestampType = timestampType
+	l.immediateMode = immediateMode
+	l.bufferSize = bufferSize
+	l.overrideSnapLen = overrideSnapLen
 
 	l.addr = addr
 	_port, _ := strconv.Atoi(port)
@@ -329,12 +338,45 @@ func (t *Listener) readPcap() {
 
 	for _, d := range devices {
 		go func(device pcap.Interface) {
-			handle, err := pcap.OpenLive(device.Name, 65536, true, t.messageExpire)
+			inactive, err := pcap.NewInactiveHandle(device.Name)
 			if err != nil {
 				log.Println("Pcap Error while opening device", device.Name, err)
 				wg.Done()
 				return
 			}
+
+			if t.timestampType != "" {
+				if tt, terr := pcap.TimestampSourceFromString(t.timestampType); terr != nil {
+					log.Println("Supported timestamp types: ", inactive.SupportedTimestamps(), device.Name)
+				} else if terr := inactive.SetTimestampSource(tt); terr != nil {
+					log.Println("Supported timestamp types: ", inactive.SupportedTimestamps(), device.Name)
+				}
+			}
+
+			if it, err := net.InterfaceByName(device.Name); err == nil && !t.overrideSnapLen {
+				// Auto-guess max length of packet to capture
+				inactive.SetSnapLen(it.MTU + 68*2)
+			} else {
+				inactive.SetSnapLen(65536)
+			}
+
+			inactive.SetTimeout(t.messageExpire)
+			inactive.SetPromisc(true)
+			inactive.SetImmediateMode(t.immediateMode)
+			if t.immediateMode {
+				log.Println("Setting immediate mode")
+			}
+			if t.bufferSize > 0 {
+				inactive.SetBufferSize(t.bufferSize)
+			}
+
+			handle, herr := inactive.Activate()
+			if herr != nil {
+				log.Println("PCAP Activate error:", herr)
+				wg.Done()
+				return
+			}
+
 			defer handle.Close()
 
 			t.mu.Lock()
@@ -424,12 +466,12 @@ func (t *Listener) readPcap() {
 					of = 4
 				case layers.LinkTypeLoop:
 					of = 4
-				case layers.LinkTypeRaw:
+				case layers.LinkTypeRaw, layers.LayerTypeIPv4:
 					of = 0
 				case layers.LinkTypeLinuxSLL:
 					of = 16
 				default:
-					log.Println("Unknown packet layer", packet)
+					log.Println("Unknown packet layer", decoder, packet)
 					break
 				}
 
@@ -647,12 +689,6 @@ func (t *Listener) readRAWSocket() {
 }
 
 func (t *Listener) buildPacket(packetSrcIP []byte, packetData []byte, timestamp time.Time) *packet {
-	copyPacketSrcIP := make([]byte, 16)
-	copyPacketData := make([]byte, len(packetData))
-
-	copy(copyPacketSrcIP, packetSrcIP)
-	copy(copyPacketData, packetSrcIP)
-
 	return &packet{
 		srcIP:     packetSrcIP,
 		data:      packetData,
@@ -692,8 +728,6 @@ func (t *Listener) processTCPPacket(packet *TCPPacket) {
 			log.Println("PANIC: pkg:", r, packet, string(debug.Stack()))
 		}
 	}()
-
-	// log.Println("PACKET:", packet, t.seqWithData)
 
 	var responseRequest *TCPMessage
 	var message *TCPMessage

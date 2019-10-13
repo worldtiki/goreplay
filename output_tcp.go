@@ -32,9 +32,9 @@ func NewTCPOutput(address string, config *TCPOutputConfig) io.Writer {
 	o.address = address
 	o.config = config
 
-	o.buf = make(chan []byte, 100)
+	o.buf = make(chan []byte, 1000)
 	if Settings.outputTCPStats {
-		o.bufStats = NewGorStat("output_tcp")
+		o.bufStats = NewGorStat("output_tcp", 5000)
 	}
 
 	for i := 0; i < 10; i++ {
@@ -66,11 +66,13 @@ func (o *TCPOutput) worker() {
 	defer conn.Close()
 
 	for {
-		conn.Write(<-o.buf)
+		data := <-o.buf
+		conn.Write(data)
 		_, err := conn.Write([]byte(payloadSeparator))
 
 		if err != nil {
-			log.Println("Lost connection with aggregator instance, reconnecting")
+			log.Println("INFO: TCP output connection closed, reconnecting")
+			o.buf <- data
 			go o.worker()
 			break
 		}

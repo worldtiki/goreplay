@@ -130,19 +130,16 @@ func (t *TCPMessage) AddPacket(packet *TCPPacket) {
 				}
 			}
 		}
-
-		if t.IsIncoming {
-			t.End = time.Now()
-		} else {
-			t.End = time.Now().Add(time.Millisecond)
-		}
-
 		if packet.OrigAck != 0 {
 			t.DataAck = packet.OrigAck
 		}
 
-		if packet.timestamp.Before(t.Start) {
+		if packet.timestamp.Before(t.Start) || t.Start.IsZero() {
 			t.Start = packet.timestamp
+		}
+
+		if packet.timestamp.After(t.End) || t.End.IsZero() {
+			t.End = packet.timestamp
 		}
 	}
 
@@ -201,7 +198,8 @@ func (t *TCPMessage) checkSeqIntegrity() {
 }
 
 var bEmptyLine = []byte("\r\n\r\n")
-var bChunkEnd = []byte("0\r\n\r\n")
+var bBR = []byte("\r\n")
+var bChunkEnd = []byte("\r\n0\r\n\r\n")
 
 func (t *TCPMessage) updateHeadersPacket() {
 	if len(t.packets) == 1 {
@@ -217,29 +215,42 @@ func (t *TCPMessage) updateHeadersPacket() {
 	}
 
 	for i, p := range t.packets {
-		if bytes.LastIndex(p.Data, bEmptyLine) != -1 {
-			t.headerPacket = i
-			return
+		if len(p.Data) >= len(bEmptyLine) {
+			if bytes.LastIndex(p.Data, bEmptyLine) != -1 {
+				t.headerPacket = i
+				return
+			}
+		} else if i > 0 && bytes.Equal(p.Data, bBR) {
+			idx := bytes.LastIndex(t.packets[i-1].Data, bBR)
+			if idx != -1 && idx == len(t.packets[i-1].Data)-len(bBR) {
+				t.headerPacket = i
+				return
+			}
 		}
 	}
 
 	return
 }
 
-// checkIfComplete returns true if all of the packets that compse the message arrived. 
+// checkIfComplete returns true if all of the packets that compse the message arrived.
 func (t *TCPMessage) checkIfComplete() {
 	if t.seqMissing || t.headerPacket == -1 {
+		// log.Println("Seq missing", t.seqMissing, t.packets)
 		return
 	}
 
 	if t.methodType == httpMethodNotFound {
+		// log.Println("Method missing", t.methodType, t.packets)
 		return
 	}
 
 	// Responses can be emitted only if we found request
 	if !t.IsIncoming && t.AssocMessage == nil {
+		// log.Println("Assoc not found", t)
 		return
 	}
+
+	// log.Println("Found?", t)
 
 	switch t.bodyType {
 	case httpBodyEmpty:
@@ -358,9 +369,19 @@ func (t *TCPMessage) updateBodyType() {
 	case httpMethodNotFound:
 		return
 	case httpMethodKnown:
+
+		if !t.IsIncoming &&
+			t.AssocMessage != nil &&
+			bytes.IndexByte(t.AssocMessage.Bytes(), ' ') > -1 &&
+			bytes.Equal([]byte("HEAD"), proto.Method(t.AssocMessage.Bytes())) {
+			// Need to check if this is a response to a head request,
+			// in which case the body has to be empty regardless.
+			t.bodyType = httpBodyEmpty
+			return
+		}
+
 		if len(lengthB) > 0 {
 			t.contentLength, _ = strconv.Atoi(string(lengthB))
-
 			if t.contentLength == 0 {
 				t.bodyType = httpBodyEmpty
 			} else {

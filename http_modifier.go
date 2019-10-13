@@ -2,9 +2,9 @@ package main
 
 import (
 	"bytes"
-	"strings"
-	"hash/fnv"
 	"encoding/base64"
+	"hash/fnv"
+	"strings"
 
 	"github.com/buger/goreplay/proto"
 )
@@ -98,7 +98,11 @@ func (m *HTTPModifier) Rewrite(payload []byte) (response []byte) {
 		for _, f := range m.config.headerFilters {
 			value := proto.Header(payload, f.name)
 
-			if len(value) > 0 && !f.regexp.Match(value) {
+			if len(value) == 0 {
+				return
+			}
+
+			if !f.regexp.Match(value) {
 				return
 			}
 		}
